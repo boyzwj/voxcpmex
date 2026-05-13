@@ -1,24 +1,15 @@
 # examples/hello_world.exs
 #
-# Basic Text-to-Speech example.
+# Basic Text-to-Speech example with proper lifecycle.
 #
 # Usage:
 #   mix run examples/hello_world.exs
 #   mix run examples/hello_world.exs --text "你好世界"
 #   mix run examples/hello_world.exs --text "Hello" --device cpu
-#   mix run examples/hello_world.exs --text "Hello" --device mps
-#   mix run examples/hello_world.exs --text "Hello" --output my_audio.wav
-#   mix run examples/hello_world.exs --text "Hello" --steps 30 --cfg 3.0
 
 {opts, _args, _invalid} =
   OptionParser.parse(System.argv(),
-    switches: [
-      text: :string,
-      device: :string,
-      output: :string,
-      steps: :integer,
-      cfg: :float
-    ]
+    switches: [text: :string, device: :string, output: :string, steps: :integer, cfg: :float]
   )
 
 text = opts[:text] || "Hello, world! This is VoxCPM2 running through Elixir."
@@ -30,9 +21,13 @@ cfg = opts[:cfg] || 2.0
 IO.puts("==> Starting VoxCPM2 on #{device}...")
 {:ok, pid} = VoxCPMEx.start_link(device: device)
 
-IO.puts("==> Waiting for model to load (may take 30-60s on first run)...")
+# Check model info
+info = VoxCPMEx.info(pid)
+IO.puts("==> Info: #{inspect(info)}")
+
+IO.puts("==> Waiting for model to load...")
 :ok = VoxCPMEx.await_ready(pid, 120_000)
-IO.puts("==> Model ready!")
+IO.puts("==> Model ready! device=#{info.device} sr=#{info.sample_rate}")
 
 IO.puts("==> Generating: \"#{text}\"")
 {:ok, audio} = VoxCPMEx.generate(pid, text,
@@ -42,4 +37,7 @@ IO.puts("==> Generating: \"#{text}\"")
 
 :ok = VoxCPMEx.save(audio, output)
 IO.puts("==> Audio saved to #{output} (#{byte_size(audio)} bytes)")
-IO.puts("==> Done! 🎉")
+
+# Clean shutdown
+VoxCPMEx.stop(pid)
+IO.puts("==> Server stopped. Done! 🎉")

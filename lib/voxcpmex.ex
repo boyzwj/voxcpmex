@@ -92,6 +92,14 @@ defmodule VoxCPMEx do
   # Lifecycle
   # ---------------------------------------------------------------------------
 
+  @doc "Returns runtime model information."
+  @spec info(GenServer.server()) :: map()
+  defdelegate info(server), to: Server
+
+  @doc "Gracefully stops the server and Python bridge."
+  @spec stop(GenServer.server()) :: :ok
+  defdelegate stop(server), to: Server
+
   @doc """
   Starts a VoxCPMEx model server.
 

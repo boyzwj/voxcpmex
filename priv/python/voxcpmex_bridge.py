@@ -1,26 +1,40 @@
 #!/usr/bin/env python3
 """
-VoxCPMEx Bridge v2 — Python bridge for Elixir VoxCPMEx library.
+VoxCPMEx Bridge v2.1 — Python bridge for Elixir VoxCPMEx library.
 
 Protocol: binary frames over stdin/stdout
   Frame: [4-byte big-endian total_length][msgpack-encoded message]
 
-MessagePack natively supports raw binary — audio is sent as raw bytes,
-eliminating base64 encoding overhead.
+Audio is raw WAV bytes inside msgpack — no base64 encoding.
 
-Streaming: each audio chunk is sent as a separate msgpack frame immediately,
-enabling true streaming playback.
+Streaming (v2.1): simplified — no stream IDs. The bridge processes one
+streaming request at a time, emitting stream_start → N×stream_chunk →
+stream_end in strict sequence.
 """
 
 import sys
 import io
 import os
 import struct
-import uuid
+import signal
 
 import msgpack
 import numpy as np
 import soundfile as sf
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown on SIGPIPE / SIGTERM
+# ---------------------------------------------------------------------------
+_shutting_down = False
+
+def _handle_signal(signum, frame):
+    global _shutting_down
+    _shutting_down = True
+    sys.stderr.write(f"Bridge received signal {signum}, shutting down\n")
+    sys.stderr.flush()
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)  # Let OS handle broken pipe
+signal.signal(signal.SIGTERM, _handle_signal)
 
 # ---------------------------------------------------------------------------
 # PyTorch early import check
@@ -32,7 +46,6 @@ except ImportError as e:
     _write_frame(err)
     sys.exit(1)
 
-# Fix torch.load device mapping
 _original_torch_load = torch.load
 
 def _patched_torch_load(f, map_location=None, **kwargs):
@@ -47,7 +60,7 @@ torch.load = _patched_torch_load
 # I/O helpers
 # ---------------------------------------------------------------------------
 def _read_exact(n: int) -> bytes:
-    """Read exactly n bytes from stdin."""
+    """Read exactly n bytes from stdin. Raises EOFError on EOF."""
     data = b""
     while len(data) < n:
         chunk = sys.stdin.buffer.read(n - len(data))
@@ -66,19 +79,23 @@ def _read_frame() -> dict:
 
 
 def _write_frame(data: bytes) -> None:
-    """Write one msgpack frame to stdout."""
-    frame_len = struct.pack(">I", len(data) + 4)
-    sys.stdout.buffer.write(frame_len + data)
-    sys.stdout.buffer.flush()
+    """Write one msgpack frame to stdout. Returns False on broken pipe."""
+    try:
+        frame_len = struct.pack(">I", len(data) + 4)
+        sys.stdout.buffer.write(frame_len + data)
+        sys.stdout.buffer.flush()
+        return True
+    except (BrokenPipeError, OSError):
+        return False
 
 
-def _send(msg: dict):
-    """Encode and send a msgpack message."""
-    _write_frame(msgpack.dumps(msg))
+def _send(msg: dict) -> bool:
+    """Encode and send. Returns False on failure."""
+    return _write_frame(msgpack.dumps(msg))
 
 
-def _send_error(error: str):
-    _send({"status": "error", "error": error})
+def _send_error(error: str) -> bool:
+    return _send({"status": "error", "error": error})
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +121,6 @@ class VoxCPMBridge:
         self.sample_rate = None
 
     def init_model(self, msg: dict) -> dict:
-        """Initialize the VoxCPM model."""
         try:
             from voxcpm import VoxCPM
 
@@ -115,7 +131,8 @@ class VoxCPMBridge:
 
             self.device = _detect_device(requested_device)
 
-            print(f"Loading {hf_model_id} on {self.device}...", file=sys.stderr, flush=True)
+            sys.stderr.write(f"Loading {hf_model_id} on {self.device}...\n")
+            sys.stderr.flush()
 
             self.model = VoxCPM.from_pretrained(
                 hf_model_id,
@@ -125,7 +142,8 @@ class VoxCPMBridge:
             )
 
             self.sample_rate = self.model.tts_model.sample_rate
-            print(f"Loaded. device={self.device} sr={self.sample_rate}", file=sys.stderr, flush=True)
+            sys.stderr.write(f"Loaded. device={self.device} sr={self.sample_rate}\n")
+            sys.stderr.flush()
 
             return {"status": "ok", "device": self.device, "sample_rate": self.sample_rate}
 
@@ -133,7 +151,6 @@ class VoxCPMBridge:
             return {"status": "error", "error": str(e)}
 
     def generate(self, msg: dict) -> dict:
-        """Generate speech. Audio returned as raw bytes in msgpack."""
         if self.model is None:
             return {"status": "error", "error": "Model not initialized"}
 
@@ -167,24 +184,17 @@ class VoxCPMBridge:
             return {"status": "error", "error": str(e)}
 
     def generate_streaming(self, msg: dict) -> None:
-        """Generate speech with streaming — sends each chunk as a separate frame.
-
-        Sends: stream_start → N × stream_chunk → stream_end
-        """
+        """Generate speech with streaming — emits frames in strict sequence."""
         if self.model is None:
             _send_error("Model not initialized")
             return
 
-        stream_id = str(uuid.uuid4())[:8]
         text = msg["text"]
 
         try:
-            # Announce stream
-            _send({
-                "type": "stream_start",
-                "stream_id": stream_id,
-                "sample_rate": self.sample_rate,
-            })
+            # Announce stream start
+            if not _send({"type": "stream_start", "sample_rate": self.sample_rate}):
+                return  # Elixir side disconnected
 
             idx = 0
             for chunk in self.model.generate_streaming(
@@ -202,30 +212,26 @@ class VoxCPMBridge:
                 retry_badcase_max_times=msg.get("retry_badcase_max_times", 3),
                 retry_badcase_ratio_threshold=msg.get("retry_badcase_ratio_threshold", 6.0),
             ):
-                # Send raw float32 chunk
+                if _shutting_down:
+                    return
+
                 chunk_bytes = chunk.astype(np.float32).tobytes()
-                _send({
+                if not _send({
                     "type": "stream_chunk",
-                    "stream_id": stream_id,
                     "chunk": chunk_bytes,
                     "index": idx,
                     "length": len(chunk),
-                })
+                }):
+                    return  # Elixir side disconnected
                 idx += 1
 
-            # End of stream
             _send({
                 "type": "stream_end",
-                "stream_id": stream_id,
                 "total_chunks": idx,
             })
 
         except Exception as e:
-            _send({
-                "type": "stream_error",
-                "stream_id": stream_id,
-                "error": str(e),
-            })
+            _send({"type": "stream_error", "error": str(e)})
 
     def load_lora(self, msg: dict) -> dict:
         if self.model is None:
@@ -260,38 +266,44 @@ class VoxCPMBridge:
 def main():
     bridge = VoxCPMBridge()
 
-    while True:
+    while not _shutting_down:
         try:
             msg = _read_frame()
         except EOFError:
+            sys.stderr.write("stdin closed, exiting\n")
+            sys.stderr.flush()
             break
         except Exception as e:
-            _send_error(f"Frame read error: {e}")
+            if not _send_error(f"Frame read error: {e}"):
+                break
             continue
 
         msg_type = msg.get("type")
 
-        if msg_type == "init":
-            _send(bridge.init_model(msg))
+        try:
+            if msg_type == "init":
+                _send(bridge.init_model(msg))
 
-        elif msg_type == "generate":
-            _send(bridge.generate(msg))
+            elif msg_type == "generate":
+                _send(bridge.generate(msg))
 
-        elif msg_type == "generate_streaming":
-            # Streaming handles its own send() calls
-            bridge.generate_streaming(msg)
+            elif msg_type == "generate_streaming":
+                bridge.generate_streaming(msg)
 
-        elif msg_type == "load_lora":
-            _send(bridge.load_lora(msg))
+            elif msg_type == "load_lora":
+                _send(bridge.load_lora(msg))
 
-        elif msg_type == "unload_lora":
-            _send(bridge.unload_lora())
+            elif msg_type == "unload_lora":
+                _send(bridge.unload_lora())
 
-        elif msg_type == "ping":
-            _send({"status": "ok", "message": "pong"})
+            elif msg_type == "ping":
+                _send({"status": "ok", "message": "pong"})
 
-        else:
-            _send_error(f"Unknown request type: {msg_type}")
+            else:
+                _send_error(f"Unknown request type: {msg_type}")
+
+        except Exception as e:
+            _send_error(f"Unhandled error: {e}")
 
 
 if __name__ == "__main__":
