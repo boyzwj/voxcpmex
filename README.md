@@ -4,9 +4,19 @@ Elixir wrapper for [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) — a **tok
 
 **2B parameters** · **30 languages** · **48kHz output** · trained on **2M+ hours** of speech data.
 
-[![Hex.pm](https://img.shields.io/badge/hex-v0.1.0-blue)](https://hex.pm/packages/voxcpmex)
+[![Hex.pm](https://img.shields.io/badge/hex-v0.2.0-blue)](https://hex.pm/packages/voxcpmex)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/HuggingFace-VoxCPM2-orange)](https://huggingface.co/openbmb/VoxCPM2)
+[![Protocol](https://img.shields.io/badge/protocol-MessagePack-brightgreen)](https://msgpack.org/)
+
+## ⚡ v0.2.0 — MessagePack Protocol + True Streaming
+
+VoxCPMEx v0.2.0 replaces JSON+Base64 with **MessagePack binary framing**:
+
+- Audio is sent as **raw bytes** — no base64 encoding, ~33% smaller on the wire
+- Control messages are compact msgpack maps
+- Frame format: `[4B BE length][msgpack payload]` — no line splitting, no JSON parsing
+- **True streaming**: `generate_streaming_async/3` returns immediately, poll with `next_chunk/2`
 
 ## Features
 
@@ -24,13 +34,12 @@ Elixir wrapper for [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) — a **tok
 VoxCPMEx uses **Erlang Ports** to communicate with a Python process running the VoxCPM2 model. Each `VoxCPMEx.start_link/1` spawns a dedicated Python process, allowing multiple models or instances to run concurrently.
 
 ```
-+---------------+      JSON/stdin       +-----------------+
-|    Elixir     | --------------------> |     Python      |
-|   GenServer   |                       |   VoxCPM2       |
-|               | <-------------------- |                 |
-+---------------+    JSON/stdout        +-----------------+
-                            Base64 WAV
-```
++---------------+   msgpack frames   +-----------------+
+|    Elixir     | -----------------> |     Python      |
+|   GenServer   |                    |   VoxCPM2       |
+|               | <----------------- |                 |
++---------------+   msgpack frames   +-----------------+
+                     raw audio bytes
 
 ## Requirements
 
@@ -175,17 +184,29 @@ VoxCPM2 is **tokenizer-free** — just feed text in any supported language, no l
 )
 ```
 
-## Streaming ⚡
+## Streaming ⚡ (v2 — true chunk-by-chunk)
 
 ```elixir
-{:ok, result} = VoxCPMEx.generate_streaming(pid, "Long text for streaming...",
+# Start async streaming — returns immediately
+{:ok, ref} = VoxCPMEx.generate_streaming_async(pid, "Long text for streaming...",
   inference_timesteps: 10,
   cfg_value: 2.0
 )
 
-IO.puts("Duration: #{result["duration"]}s")
-IO.puts("Chunks: #{result["num_chunks"]}")
-:ok = VoxCPMEx.save(result["audio"], "streaming.wav")
+# Poll for chunks as they're generated
+Stream.unfold(ref, fn ref ->
+  case VoxCPMEx.next_chunk(pid, ref) do
+    {:ok, chunk} -> {chunk, ref}       # got a chunk
+    :eos -> nil                         # stream done
+    {:error, reason} -> nil             # error
+  end
+end)
+|> Enum.to_list()
+
+# Or collect all at once
+{:ok, ref} = VoxCPMEx.generate_streaming_async(pid, "Long text...")
+{:ok, audio} = VoxCPMEx.collect_stream(pid, ref)
+:ok = VoxCPMEx.save(audio, "streaming.wav")
 ```
 
 ## Named Servers
