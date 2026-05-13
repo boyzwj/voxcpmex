@@ -488,7 +488,7 @@ defmodule VoxCPMEx.Server do
   # =========================================================================
 
   defp send_frame(port, msg) do
-    data = Msgpax.pack!(msg)
+    data = msg |> Msgpax.pack!() |> IO.iodata_to_binary()
     len = byte_size(data) + @frame_header_bytes
     frame = <<len::32-unsigned-big-integer>> <> data
     send(port, {self(), {:command, frame}})
