@@ -64,10 +64,10 @@ defmodule Mix.Tasks.Voxcpmex.Setup do
       end
     end
 
-    # Install voxcpm
-    IO.puts("==> Installing voxcpm...")
-    case System.cmd(pip, ["install", "voxcpm", "soundfile"], into: IO.stream(:stdio, :line), stderr_to_stdout: true) do
-      {_, 0} -> IO.puts("==> voxcpm installed successfully")
+    # Install voxcpm + msgpack (for MessagePack protocol)
+    IO.puts("==> Installing voxcpm + msgpack...")
+    case System.cmd(pip, ["install", "voxcpm", "soundfile", "msgpack"], into: IO.stream(:stdio, :line), stderr_to_stdout: true) do
+      {_, 0} -> IO.puts("==> voxcpm + msgpack installed successfully")
       {_, code} ->
         IO.puts(:stderr, "==> Error: voxcpm install failed with exit code #{code}")
         System.halt(1)

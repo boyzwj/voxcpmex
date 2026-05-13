@@ -1,7 +1,7 @@
 defmodule VoxCPMEx.MixProject do
   use Mix.Project
 
-  @version "0.1.0"
+  @version "0.2.0"
   @source_url "https://github.com/holsee/voxcpmex"
 
   def project do
@@ -28,6 +28,7 @@ defmodule VoxCPMEx.MixProject do
 
   defp deps do
     [
+      {:msgpax, "~> 2.4"},
       {:jason, "~> 1.4"},
       {:ex_doc, ">= 0.0.0", only: :dev, runtime: false}
     ]
@@ -35,9 +36,9 @@ defmodule VoxCPMEx.MixProject do
 
   defp description do
     """
-    Elixir wrapper for VoxCPM2 — tokenizer-free, diffusion autoregressive
-    Text-to-Speech with 2B params, 30 languages, 48kHz output, and zero-shot
-    voice cloning. Voice Design lets you create voices from text descriptions.
+    Elixir wrapper for VoxCPM2 — 2B-param, 30-language, 48kHz TTS with
+    Voice Design, controllable cloning, and true chunk-by-chunk streaming.
+    Uses MessagePack binary protocol for zero-overhead audio transfer.
     """
   end
 

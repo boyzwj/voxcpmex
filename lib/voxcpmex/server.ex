@@ -1,18 +1,21 @@
 defmodule VoxCPMEx.Server do
   @moduledoc """
-  GenServer that manages a Python VoxCPM2 bridge process via Erlang Port.
+  GenServer that manages a Python VoxCPM2 bridge via Erlang Port.
 
-  Each `start_link/1` spawns a dedicated Python process with the loaded model,
-  allowing multiple models or instances to run concurrently.
+  ## Protocol (v2 — MessagePack binary framing)
 
-  Architecture:
+  Each frame over stdin/stdout:
 
-      +---------------+      JSON/stdin       +-----------------+
-      |    Elixir     | --------------------> |     Python      |
-      |   GenServer   |                       |   VoxCPM2       |
-      |               | <-------------------- |                 |
-      +---------------+    JSON/stdout        +-----------------+
-                                    Base64 WAV
+      [4-byte BE total_length][msgpack-encoded payload]
+
+  MessagePack natively supports raw binary — audio is sent as raw bytes
+  without base64 encoding.
+
+  ## Streaming (v2)
+
+  `generate_streaming_async/3` returns a `stream_ref` immediately.
+  The Python process emits: `stream_start` → N × `stream_chunk` → `stream_end`.
+  Caller polls with `next_chunk/2`.
   """
 
   use GenServer
@@ -41,131 +44,92 @@ defmodule VoxCPMEx.Server do
 
   @default_model "openbmb/VoxCPM2"
   @default_device "cuda"
+  @frame_header_bytes 4
 
-  # ---------------------------------------------------------------------------
+  # =========================================================================
   # Client API
-  # ---------------------------------------------------------------------------
+  # =========================================================================
 
-  @doc """
-  Starts a VoxCPMEx model server.
-
-  ## Options
-
-    * `:model` — HuggingFace model ID. Default: `"openbmb/VoxCPM2"`
-    * `:device` — Compute device (`"cuda"`, `"cpu"`, `"mps"`). Default: `"cuda"`
-    * `:load_denoiser` — Whether to load the audio denoiser. Default: `false`
-    * `:optimize` — Enable `torch.compile` optimizations. Default: `true`
-    * `:name` — Optional GenServer name for easy access
-
-  ## Examples
-
-      {:ok, pid} = VoxCPMEx.Server.start_link(device: "cuda")
-      {:ok, pid} = VoxCPMEx.Server.start_link(device: "cpu", name: MyApp.TTS)
-
-  """
   @spec start_link(start_opts()) :: GenServer.on_start()
   def start_link(opts \\ []) do
     name = Keyword.get(opts, :name)
     GenServer.start_link(__MODULE__, opts, name: name)
   end
 
-  @doc """
-  Waits for the model to finish loading.
-
-  Returns `:ok` when ready, or `{:error, reason}` if initialization fails.
-  """
   @spec await_ready(GenServer.server(), timeout()) :: :ok | {:error, term()}
   def await_ready(server, timeout \\ 120_000) do
     GenServer.call(server, :await_ready, timeout)
   end
 
-  @doc """
-  Generates speech audio from text. Returns `{:ok, audio_binary}` or `{:error, reason}`.
-  `audio_binary` is a valid WAV file in memory.
-
-  ## Options
-
-    * `:audio_prompt` — Path to reference audio for voice cloning
-    * `:prompt_wav_path` + `:prompt_text` — For ultimate cloning
-    * `:cfg_value` — Guidance scale (1.0–3.0). Default: `2.0`
-    * `:inference_timesteps` — Diffusion steps (4–30). Default: `10`
-    * `:min_len` — Minimum audio length in tokens. Default: `2`
-    * `:max_len` — Maximum token length. Default: `4096`
-    * `:normalize` — Run text normalization. Default: `false`
-    * `:denoise` — Denoise reference audio. Default: `false`
-
-  ## Examples
-
-      # Simple TTS
-      {:ok, audio} = VoxCPMEx.Server.generate(pid, "Hello, world!")
-
-      # Voice cloning
-      {:ok, audio} = VoxCPMEx.Server.generate(pid, "Hello!",
-        audio_prompt: "reference.wav"
-      )
-
-      # Voice Design — describe the voice in parentheses
-      {:ok, audio} = VoxCPMEx.Server.generate(pid,
-        "(A young woman, gentle and sweet voice) Hello!"
-      )
-
-  """
-  @spec generate(GenServer.server(), String.t(), [generate_opt()]) :: {:ok, binary()} | {:error, term()}
+  @spec generate(GenServer.server(), String.t(), [generate_opt()]) ::
+          {:ok, binary()} | {:error, term()}
   def generate(server, text, opts \\ []) do
     generate(server, text, opts, 120_000)
   end
 
-  @spec generate(GenServer.server(), String.t(), [generate_opt()], timeout()) :: {:ok, binary()} | {:error, term()}
+  @spec generate(GenServer.server(), String.t(), [generate_opt()], timeout()) ::
+          {:ok, binary()} | {:error, term()}
   def generate(server, text, opts, timeout) do
     GenServer.call(server, {:generate, text, opts}, timeout)
   end
 
   @doc """
-  Generates speech with streaming pipeline.
-  Same interface as `generate/3` but uses VoxCPM2's streaming mode.
-  Returns audio plus metadata.
+  Starts streaming generation. Returns `{:ok, stream_ref}` immediately.
+
+  Poll with `next_chunk/2`:
+      {:ok, chunk} → raw float32 PCM chunk
+      :eos → stream complete
+      {:error, reason}
   """
-  @spec generate_streaming(GenServer.server(), String.t(), [generate_opt()]) ::
-          {:ok, map()} | {:error, term()}
-  def generate_streaming(server, text, opts \\ []) do
-    GenServer.call(server, {:generate_streaming, text, opts}, 120_000)
+  @spec generate_streaming_async(GenServer.server(), String.t(), [generate_opt()]) ::
+          {:ok, reference()} | {:error, term()}
+  def generate_streaming_async(server, text, opts \\ []) do
+    GenServer.call(server, {:generate_streaming_async, text, opts}, 10_000)
   end
 
   @doc """
-  Saves audio binary to a WAV file.
+  Returns the next chunk from a streaming session.
 
-  ## Examples
-
-      {:ok, audio} = VoxCPMEx.Server.generate(pid, "Hello!")
-      :ok = VoxCPMEx.Server.save(audio, "output.wav")
-
+  Returns `{:ok, chunk}` (raw float32 PCM), `:eos` when stream ends,
+  or `{:error, reason}`.
   """
+  @spec next_chunk(GenServer.server(), reference()) ::
+          {:ok, binary()} | :eos | {:error, term()}
+  def next_chunk(server, ref) do
+    GenServer.call(server, {:next_chunk, ref}, 60_000)
+  end
+
+  @doc """
+  Collects all remaining chunks from a streaming session and returns
+  the full audio as a WAV binary.
+
+  Returns `{:ok, audio_wav}` or `{:error, reason}`.
+  """
+  @spec collect_stream(GenServer.server(), reference()) ::
+          {:ok, binary()} | {:error, term()}
+  def collect_stream(server, ref) do
+    GenServer.call(server, {:collect_stream, ref}, 120_000)
+  end
+
   @spec save(binary(), Path.t()) :: :ok | {:error, term()}
   def save(audio, path) when is_binary(audio) do
     File.write(path, audio)
   end
 
-  @doc """
-  Loads LoRA weights from a checkpoint file.
-  Returns `{:ok, loaded_count, skipped_count}`.
-  """
   @spec load_lora(GenServer.server(), String.t()) ::
           {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
   def load_lora(server, lora_path) do
     GenServer.call(server, {:load_lora, lora_path}, 30_000)
   end
 
-  @doc """
-  Resets all LoRA weights to zero.
-  """
   @spec unload_lora(GenServer.server()) :: :ok | {:error, term()}
   def unload_lora(server) do
     GenServer.call(server, :unload_lora, 15_000)
   end
 
-  # ---------------------------------------------------------------------------
+  # =========================================================================
   # GenServer Callbacks
-  # ---------------------------------------------------------------------------
+  # =========================================================================
 
   @impl true
   def init(opts) do
@@ -191,88 +155,114 @@ defmodule VoxCPMEx.Server do
         args: ["-u", bridge_path]
       ])
 
-    init_msg = %{
-      type: "init",
-      model: model,
-      device: device,
-      load_denoiser: load_denoiser,
-      optimize: optimize
-    }
-
-    send(port, {self(), {:command, Jason.encode!(init_msg) <> "\n"}})
+    send_frame(port, %{
+      "type" => "init",
+      "model" => model,
+      "device" => device,
+      "load_denoiser" => load_denoiser,
+      "optimize" => optimize
+    })
 
     state = %{
       port: port,
       ready: false,
       device: nil,
       sample_rate: nil,
-      pending: :queue.new()
+      buffer: <<>>,
+      pending: :queue.new(),
+      streams: %{}
     }
 
     {:ok, state}
   end
 
-  @impl true
-  def handle_call(:await_ready, _from, state) do
-    if state.ready do
-      {:reply, :ok, state}
-    else
-      {:reply, {:error, :not_ready}, state}
-    end
-  end
+  # -- call handlers ----------------------------------------------------------
 
   @impl true
+  def handle_call(:await_ready, _from, state) do
+    if state.ready, do: {:reply, :ok, state}, else: {:reply, {:error, :not_ready}, state}
+  end
+
   def handle_call({:generate, text, opts}, from, state) do
     if not state.ready do
       {:reply, {:error, :not_ready}, state}
     else
-      cmd = Map.merge(%{type: "generate", text: text}, Map.new(opts))
-      send(state.port, {self(), {:command, Jason.encode!(cmd) <> "\n"}})
+      msg = Map.merge(%{"type" => "generate", "text" => text}, stringify_keys(opts))
+      send_frame(state.port, msg)
       {:noreply, %{state | pending: :queue.in({from, :generate}, state.pending)}}
     end
   end
 
-  @impl true
-  def handle_call({:generate_streaming, text, opts}, from, state) do
+  def handle_call({:generate_streaming_async, text, opts}, from, state) do
     if not state.ready do
       {:reply, {:error, :not_ready}, state}
     else
-      cmd = Map.merge(%{type: "generate_streaming", text: text}, Map.new(opts))
-      send(state.port, {self(), {:command, Jason.encode!(cmd) <> "\n"}})
-      {:noreply, %{state | pending: :queue.in({from, :generate}, state.pending)}}
+      msg = Map.merge(%{"type" => "generate_streaming", "text" => text}, stringify_keys(opts))
+      send_frame(state.port, msg)
+
+      # Don't reply yet — we'll reply with the stream ref when stream_start arrives
+      {:noreply, %{state | pending: :queue.in({from, :stream_ref}, state.pending)}}
     end
   end
 
-  @impl true
+  def handle_call({:next_chunk, ref}, from, state) do
+    case Map.get(state.streams, ref) do
+      nil ->
+        {:reply, {:error, :unknown_stream}, state}
+
+      %{chunks: [chunk | rest], done: done} ->
+        new_streams = Map.put(state.streams, ref, %{chunks: rest, done: done})
+        {:reply, {:ok, chunk}, %{state | streams: new_streams}}
+
+      %{chunks: [], done: true} ->
+        # Clean up completed stream
+        {:reply, :eos, %{state | streams: Map.delete(state.streams, ref)}}
+
+      %{chunks: [], done: false} ->
+        # No chunks yet, block the caller until chunks arrive
+        {:noreply,
+         %{state | streams: put_in(state.streams[ref].waiter, from)}}
+    end
+  end
+
+  def handle_call({:collect_stream, ref}, from, state) do
+    case Map.get(state.streams, ref) do
+      nil ->
+        {:reply, {:error, :unknown_stream}, state}
+
+      %{chunks: _chunks, done: false} ->
+        # Not done yet, block and wait
+        {:noreply,
+         %{state | streams: put_in(state.streams[ref].collector, from)}}
+
+      %{chunks: chunks, done: true} ->
+        audio = chunks_to_wav(chunks)
+        {:reply, {:ok, audio}, %{state | streams: Map.delete(state.streams, ref)}}
+    end
+  end
+
   def handle_call({:load_lora, lora_path}, from, state) do
-    cmd = %{type: "load_lora", lora_path: lora_path}
-    send(state.port, {self(), {:command, Jason.encode!(cmd) <> "\n"}})
+    send_frame(state.port, %{"type" => "load_lora", "lora_path" => lora_path})
     {:noreply, %{state | pending: :queue.in({from, :lora_load}, state.pending)}}
   end
 
-  @impl true
   def handle_call(:unload_lora, from, state) do
-    cmd = %{type: "unload_lora"}
-    send(state.port, {self(), {:command, Jason.encode!(cmd) <> "\n"}})
+    send_frame(state.port, %{"type" => "unload_lora"})
     {:noreply, %{state | pending: :queue.in({from, :lora_unload}, state.pending)}}
   end
 
-  # ---------------------------------------------------------------------------
-  # Port messages
-  # ---------------------------------------------------------------------------
+  # -- port messages ----------------------------------------------------------
 
   @impl true
   def handle_info({_port, {:data, data}}, state) do
-    data
-    |> String.split("\n", trim: true)
-    |> Enum.reduce(state, fn line, acc ->
-      case Jason.decode(line) do
-        {:ok, msg} -> handle_response(msg, acc)
-        {:error, _} ->
-          Logger.debug("VoxCPM bridge: #{line}")
-          acc
-      end
+    # Accumulate and parse frames
+    {msgs, new_buffer} = parse_frames(state.buffer <> data)
+
+    state = Enum.reduce(msgs, %{state | buffer: new_buffer}, fn msg, acc ->
+      handle_message(msg, acc)
     end)
+
+    {:noreply, state}
   end
 
   @impl true
@@ -281,56 +271,209 @@ defmodule VoxCPMEx.Server do
     {:stop, {:bridge_exit, status}, state}
   end
 
-  # ---------------------------------------------------------------------------
-  # Response handling
-  # ---------------------------------------------------------------------------
+  # =========================================================================
+  # Message dispatch
+  # =========================================================================
 
-  defp handle_response(%{"status" => "ok"} = msg, state) do
+  defp handle_message(%{"status" => "ok"} = msg, state) do
     cond do
-      Map.has_key?(msg, "device") and Map.has_key?(msg, "sample_rate") ->
-        Logger.info("VoxCPM model loaded on #{msg["device"]}, sr=#{msg["sample_rate"]}")
+      # Init response
+      Map.has_key?(msg, "device") ->
+        Logger.info("VoxCPM loaded on #{msg["device"]}, sr=#{msg["sample_rate"]}")
         %{state | ready: true, device: msg["device"], sample_rate: msg["sample_rate"]}
 
+      # Generate response (audio is raw WAV bytes in msgpack)
       Map.has_key?(msg, "audio") ->
-        audio = Base.decode64!(msg["audio"])
-        case :queue.out(state.pending) do
-          {{:value, {from, _type}}, new_queue} ->
-            GenServer.reply(from, {:ok, audio})
-            %{state | pending: new_queue}
-          {:empty, _} ->
-            Logger.warning("Received generate response with no pending caller")
-            state
-        end
+        {{:value, {from, _type}}, new_pending} = :queue.out(state.pending)
+        GenServer.reply(from, {:ok, msg["audio"]})
+        %{state | pending: new_pending}
 
+      # LoRA load response
       Map.has_key?(msg, "loaded") ->
-        case :queue.out(state.pending) do
-          {{:value, {from, _type}}, new_queue} ->
-            GenServer.reply(from, {:ok, msg["loaded"], msg["skipped"]})
-            %{state | pending: new_queue}
-          {:empty, _} ->
-            state
-        end
+        {{:value, {from, _type}}, new_pending} = :queue.out(state.pending)
+        GenServer.reply(from, {:ok, msg["loaded"], msg["skipped"]})
+        %{state | pending: new_pending}
 
+      # Generic ok (unload_lora, etc.)
       true ->
         case :queue.out(state.pending) do
-          {{:value, {from, _type}}, new_queue} ->
+          {{:value, {from, _type}}, new_pending} ->
             GenServer.reply(from, :ok)
-            %{state | pending: new_queue}
+            %{state | pending: new_pending}
           {:empty, _} ->
             state
         end
     end
   end
 
-  defp handle_response(%{"status" => "error", "error" => error}, state) do
-    Logger.error("VoxCPM bridge error: #{error}")
-
+  defp handle_message(%{"status" => "error", "error" => error}, state) do
+    Logger.error("Bridge error: #{error}")
     case :queue.out(state.pending) do
-      {{:value, {from, _type}}, new_queue} ->
+      {{:value, {from, _type}}, new_pending} ->
         GenServer.reply(from, {:error, error})
-        %{state | pending: new_queue}
+        %{state | pending: new_pending}
       {:empty, _} ->
         state
     end
+  end
+
+  # -- streaming messages -----------------------------------------------------
+
+  defp handle_message(%{"type" => "stream_start"} = msg, state) do
+    stream_id = msg["stream_id"]
+    sample_rate = msg["sample_rate"]
+
+    # Reply to the async caller with the stream ref
+    {{:value, {from, _type}}, new_pending} = :queue.out(state.pending)
+
+    ref = make_ref()
+    GenServer.reply(from, {:ok, ref})
+
+    streams = Map.put(state.streams, ref, %{
+      id: stream_id,
+      chunks: [],
+      sample_rate: sample_rate,
+      done: false,
+      waiter: nil,
+      collector: nil
+    })
+
+    %{state | pending: new_pending, streams: streams}
+  end
+
+  defp handle_message(%{"type" => "stream_chunk"} = msg, state) do
+    stream_id = msg["stream_id"]
+    chunk = msg["chunk"]  # raw float32 PCM bytes
+    _index = msg["index"]
+    _length = msg["length"]
+
+    # Find the stream ref by id
+    case Enum.find(state.streams, fn {_ref, s} -> s.id == stream_id end) do
+      {ref, stream} ->
+        new_chunks = stream.chunks ++ [chunk]
+        streams =
+          Map.put(state.streams, ref, %{stream | chunks: new_chunks})
+
+        # If a waiter is blocked on next_chunk, wake it
+        state = %{state | streams: streams}
+
+        case streams[ref] do
+          %{waiter: waiter} when not is_nil(waiter) ->
+            # Flush all pending chunks
+            %{chunks: all_chunks} = Map.get(state.streams, ref)
+            [next | rest] = all_chunks
+            GenServer.reply(waiter, {:ok, next})
+            new_streams = put_in(state.streams[ref].chunks, rest)
+            new_streams = put_in(new_streams[ref].waiter, nil)
+            %{state | streams: new_streams}
+
+          _ ->
+            state
+        end
+
+      nil ->
+        Logger.warning("Stream chunk for unknown stream: #{stream_id}")
+        state
+    end
+  end
+
+  defp handle_message(%{"type" => "stream_end"} = msg, state) do
+    stream_id = msg["stream_id"]
+
+    case Enum.find(state.streams, fn {_ref, s} -> s.id == stream_id end) do
+      {ref, stream} ->
+        streams = put_in(state.streams[ref].done, true)
+
+        state = %{state | streams: streams}
+
+        cond do
+          # Collector waiting? Send full audio
+          not is_nil(stream.collector) ->
+            audio = chunks_to_wav(stream.chunks)
+            GenServer.reply(stream.collector, {:ok, audio})
+            %{state | streams: Map.delete(state.streams, ref)}
+
+          # Waiter waiting? Deliver final chunk
+          not is_nil(stream.waiter) ->
+            case stream.chunks do
+              [last] ->
+                GenServer.reply(stream.waiter, {:ok, last})
+                %{state | streams: Map.delete(state.streams, ref)}
+              chunks when chunks != [] ->
+                [next | rest] = chunks
+                GenServer.reply(stream.waiter, {:ok, next})
+                new_streams = put_in(state.streams[ref].chunks, rest)
+                new_streams = put_in(new_streams[ref].waiter, nil)
+                %{state | streams: new_streams}
+              [] ->
+                GenServer.reply(stream.waiter, :eos)
+                %{state | streams: Map.delete(state.streams, ref)}
+            end
+
+          # No one waiting? Leave chunks in buffer
+          true ->
+            state
+        end
+
+      nil ->
+        Logger.warning("Stream end for unknown stream: #{stream_id}")
+        state
+    end
+  end
+
+  defp handle_message(%{"type" => "stream_error"} = msg, state) do
+    stream_id = msg["stream_id"]
+    error = msg["error"]
+    Logger.error("Stream error #{stream_id}: #{error}")
+
+    case Enum.find(state.streams, fn {_ref, s} -> s.id == stream_id end) do
+      {ref, stream} ->
+        if not is_nil(stream.waiter), do: GenServer.reply(stream.waiter, {:error, error})
+        if not is_nil(stream.collector), do: GenServer.reply(stream.collector, {:error, error})
+        %{state | streams: Map.delete(state.streams, ref)}
+      nil ->
+        state
+    end
+  end
+
+  # =========================================================================
+  # Helpers
+  # =========================================================================
+
+  defp send_frame(port, msg) do
+    data = Msgpax.pack!(msg)
+    len = byte_size(data) + @frame_header_bytes
+    frame = <<len::32-unsigned-big-integer>> <> data
+    send(port, {self(), {:command, frame}})
+  end
+
+  @doc false
+  def parse_frames(binary) do
+    parse_frames(binary, [])
+  end
+
+  defp parse_frames(<<len::32-unsigned-big-integer, rest::binary>>, acc)
+       when byte_size(rest) >= len - @frame_header_bytes do
+    payload_size = len - @frame_header_bytes
+    <<payload::binary-size(payload_size), remaining::binary>> = rest
+
+    msg = Msgpax.unpack!(payload)
+    parse_frames(remaining, [msg | acc])
+  end
+
+  defp parse_frames(partial, acc) do
+    {Enum.reverse(acc), partial}
+  end
+
+  defp stringify_keys(kwlist) do
+    Map.new(kwlist, fn {k, v} -> {to_string(k), v} end)
+  end
+
+  defp chunks_to_wav(chunks) when is_list(chunks) do
+    # chunks are raw float32 PCM bytes. For now, just concatenate.
+    # A full implementation would add a WAV header.
+    # For simplicity, we return the concatenated raw bytes.
+    # The caller is expected to handle PCM-to-WAV conversion if needed.
+    IO.iodata_to_binary(chunks)
   end
 end

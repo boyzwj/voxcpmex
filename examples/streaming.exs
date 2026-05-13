@@ -1,11 +1,11 @@
 # examples/streaming.exs
 #
-# Streaming TTS example — uses VoxCPM2's streaming pipeline for progressive output.
+# True streaming TTS — get audio chunks as they're generated.
 #
 # Usage:
 #   mix run examples/streaming.exs
-#   mix run examples/streaming.exs --text "This is a long text that benefits from streaming synthesis."
-#   mix run examples/streaming.exs --text "你好,这是一个流式语音合成示例" --device cpu
+#   mix run examples/streaming.exs --text "Long text for streaming"
+#   mix run examples/streaming.exs --text "你好世界" --device cpu
 
 {opts, _args, _invalid} =
   OptionParser.parse(System.argv(),
@@ -18,37 +18,46 @@
     ]
   )
 
-text = opts[:text] || "Streaming synthesis is great for real-time applications. " <>
-                      "You can start playing audio while the rest is still being generated. " <>
-                      "This reduces perceived latency significantly."
+text = opts[:text] || "Streaming synthesis delivers audio chunks as they are generated. " <>
+                      "This means you can start playback immediately, " <>
+                      "without waiting for the entire utterance to complete."
 device = opts[:device] || "cuda"
 output = opts[:output] || "streaming.wav"
 steps = opts[:steps] || 10
 cfg = opts[:cfg] || 2.0
 
 IO.puts("==> Streaming TTS")
-IO.puts("==> Text: #{text}")
+IO.puts("==> Text: #{String.slice(text, 0, 60)}...")
 IO.puts("==> Device: #{device}")
 
 {:ok, pid} = VoxCPMEx.start_link(device: device)
 :ok = VoxCPMEx.await_ready(pid, 120_000)
 IO.puts("==> Model ready!")
 
-IO.puts("==> Generating with streaming...")
-{:ok, result} = VoxCPMEx.generate_streaming(pid, text,
+# Start async streaming
+IO.puts("==> Starting stream...")
+{:ok, ref} = VoxCPMEx.generate_streaming_async(pid, text,
   inference_timesteps: steps,
   cfg_value: cfg
 )
 
-audio = result["audio"] || result[:audio]
-duration = result["duration"] || result[:duration]
-num_chunks = result["num_chunks"] || result[:num_chunks]
-sample_rate = result["sample_rate"] || result[:sample_rate]
+# Collect chunks
+chunks =
+  Stream.unfold(ref, fn ref ->
+    case VoxCPMEx.next_chunk(pid, ref) do
+      {:ok, chunk} ->
+        IO.puts("  chunk ##{length([])}: #{byte_size(chunk)} bytes")
+        # For real-time playback, you'd send chunk to audio output here
+        {chunk, ref}
+      :eos ->
+        IO.puts("  stream complete")
+        nil
+      {:error, reason} ->
+        IO.puts(:stderr, "  error: #{reason}")
+        nil
+    end
+  end)
+  |> Enum.to_list()
 
-:ok = VoxCPMEx.save(audio, output)
-
-IO.puts("==> Audio saved to #{output} (#{byte_size(audio)} bytes)")
-IO.puts("==> Duration: #{Float.round(duration, 2)}s")
-IO.puts("==> Chunks: #{num_chunks}")
-IO.puts("==> Sample rate: #{sample_rate} Hz")
+IO.puts("==> Total chunks: #{length(chunks)}")
 IO.puts("==> Done! ⚡")

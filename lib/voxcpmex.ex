@@ -3,90 +3,78 @@ defmodule VoxCPMEx do
   Elixir wrapper for [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) —
   a tokenizer-free, diffusion autoregressive Text-to-Speech model from OpenBMB.
 
-  **2B parameters**, **30 languages**, **48kHz** output,
-  trained on over **2 million hours** of multilingual speech data.
+  **2B parameters** · **30 languages** · **48kHz output** · 2M+ hours training data.
 
   ## Features
 
-    * 🌍 **30-Language Multilingual** — Supports Chinese, English, Japanese,
-      Korean, Arabic, French, German, and 23+ more
-    * 🎨 **Voice Design** — Generate a novel voice from a natural-language
-      description alone; *no reference audio required*
-    * 🎛️ **Controllable Cloning** — Clone any voice from a short clip, with
-      optional style guidance
-    * 🎙️ **Ultimate Cloning** — Audio-continuation cloning with transcript
-      for every vocal nuance
-    * 🔊 **48kHz Studio-Quality Output** — AudioVAE V2 super-resolution
-    * ⚡ **Streaming** — RTF as low as ~0.3 on RTX 4090
-    * 🎓 **LoRA Fine-Tuning** — Adapt with as little as 5–10 minutes of audio
+    * 🌍 **30-Language Multilingual** — Chinese, English, Japanese, Korean, Arabic,
+      French, German, and 23+ more
+    * 🎨 **Voice Design** — Generate a novel voice from text description alone
+    * 🎛️ **Controllable Cloning** — Clone any voice from a short clip, with style guidance
+    * 🎙️ **Ultimate Cloning** — Audio-continuation cloning for maximum fidelity
+    * 🔊 **48kHz Studio Output** — AudioVAE V2 super-resolution
+    * ⚡ **True Streaming** — Get audio chunks as they're generated
+    * 🎓 **LoRA Fine-Tuning** — Adapt with 5–10 minutes of audio
+
+  ## Protocol (v2)
+
+  VoxCPMEx uses **MessagePack** over **binary-framed** Erlang Ports.
+  Audio is transmitted as raw bytes — no base64 encoding overhead.
 
   ## Quick Start
 
-      # Start a model server
       {:ok, pid} = VoxCPMEx.start_link(device: "cuda")
-
-      # Wait for model to load (30-60s on first run, downloads ~8GB)
       :ok = VoxCPMEx.await_ready(pid)
-
-      # Generate speech
       {:ok, audio} = VoxCPMEx.generate(pid, "Hello, world!")
       :ok = VoxCPMEx.save(audio, "output.wav")
 
   ## Voice Design
 
-  Describe the voice in parentheses at the start of text:
-
       {:ok, audio} = VoxCPMEx.generate(pid,
-        "(A young woman, gentle and sweet voice) Hello, welcome!"
+        "(A young woman, gentle and sweet voice) Welcome!"
       )
 
   ## Voice Cloning
-
-  Provide a reference audio file (short clip):
 
       {:ok, audio} = VoxCPMEx.generate(pid, "Hello in my voice!",
         audio_prompt: "reference.wav"
       )
 
-  ## Ultimate Cloning
+  ## Streaming (v2 — true chunk-by-chunk)
 
-  Provide reference audio + its exact transcript:
+      {:ok, ref} = VoxCPMEx.generate_streaming_async(pid, "Long text...")
+      stream_loop(ref)
 
-      {:ok, audio} = VoxCPMEx.generate(pid, "This is an ultimate clone.",
-        prompt_wav_path: "speaker.wav",
-        prompt_text: "The transcript of the reference.",
-        audio_prompt: "speaker.wav"
-      )
+      defp stream_loop(ref) do
+        case VoxCPMEx.next_chunk(pid, ref) do
+          {:ok, chunk} -> IO.puts("got chunk"); stream_loop(ref)
+          :eos -> IO.puts("done!")
+          {:error, reason} -> IO.puts("error")
+        end
+      end
 
-  ## Named Servers
+  Or collect everything at once:
 
-      {:ok, _pid} = VoxCPMEx.start_link(device: "cuda", name: MyApp.TTS)
-      {:ok, audio} = VoxCPMEx.generate(MyApp.TTS, "Hello!")
+      {:ok, ref} = VoxCPMEx.generate_streaming_async(pid, "Long text...")
+      {:ok, audio} = VoxCPMEx.collect_stream(pid, ref)
 
   ## Requirements
 
-    * Python ≥ 3.10, `voxcpm` pip package
-    * CUDA GPU (8+ GB VRAM recommended), Apple Silicon (MPS), or CPU
+    * Python ≥ 3.10, `voxcpm` + `msgpack` pip packages
+    * CUDA GPU (8+ GB VRAM), Apple Silicon (MPS), or CPU
     * Elixir ≥ 1.14
 
   ## Installation
 
-  1. Add to `mix.exs`:
+      # mix.exs
+      {:voxcpmex, "~> 0.2.0"}
 
-      ```elixir
-      {:voxcpmex, "~> 0.1.0"}
-      ```
-
-  2. Install Python dependencies:
-
-      ```bash
+      # Install Python deps
       mix voxcpmex.setup
-      ```
   """
 
   alias VoxCPMEx.Server
 
-  @typedoc "Audio data as a binary WAV file in memory"
   @type audio :: binary()
 
   @type generate_opt ::
@@ -110,95 +98,127 @@ defmodule VoxCPMEx do
   ## Options
 
     * `:model` — HuggingFace model ID. Default: `"openbmb/VoxCPM2"`
-    * `:device` — Compute device (`"cuda"`, `"cpu"`, `"mps"`). Default: `"cuda"`
-    * `:load_denoiser` — Load audio denoiser for reference audio cleanup. Default: `false`
-    * `:optimize` — Enable `torch.compile` for faster inference. Default: `true`
+    * `:device` — `"cuda"`, `"cpu"`, `"mps"`. Default: `"cuda"`
+    * `:load_denoiser` — Load audio denoiser. Default: `false`
+    * `:optimize` — Enable `torch.compile`. Default: `true`
     * `:name` — Optional GenServer name
-
-  ## Examples
-
-      {:ok, pid} = VoxCPMEx.start_link(device: "cuda")
-      {:ok, pid} = VoxCPMEx.start_link(device: "cpu", name: TTS)
-
   """
   @spec start_link(Server.start_opts()) :: GenServer.on_start()
   defdelegate start_link(opts), to: Server
 
   @doc """
-  Waits for the model to finish loading and be ready for generation.
-
-  Returns `:ok` when ready, or `{:error, :not_ready}` if the timeout is reached.
+  Waits for the model to finish loading. Returns `:ok` when ready.
   """
   @spec await_ready(GenServer.server(), timeout()) :: :ok | {:error, term()}
   defdelegate await_ready(server, timeout \\ 120_000), to: Server
 
   # ---------------------------------------------------------------------------
-  # Generation
+  # Synchronous Generation
   # ---------------------------------------------------------------------------
 
   @doc """
-  Generates speech audio from text.
-
-  Returns `{:ok, audio_binary}` where `audio_binary` is a valid WAV file in memory.
+  Generates speech audio from text. Returns `{:ok, audio_wav}`.
 
   ## Options
 
-    * `:audio_prompt` — Reference audio path for voice cloning
-    * `:prompt_wav_path` + `:prompt_text` — For ultimate cloning
-    * `:cfg_value` — Guidance scale (recommended: 1.0–3.0). Default: `2.0`
-    * `:inference_timesteps` — Diffusion steps (recommended: 4–30). Default: `10`
-    * `:min_len` — Minimum audio length in tokens. Default: `2`
-    * `:max_len` — Maximum token length. Default: `4096`
-    * `:normalize` — Run text normalization (expand numbers/dates). Default: `false`
-    * `:denoise` — Denoise reference audio before cloning. Default: `false`
+    * `:audio_prompt` — Reference audio for voice cloning
+    * `:prompt_wav_path` + `:prompt_text` — Ultimate cloning
+    * `:cfg_value` — Guidance scale (1.0–3.0). Default: `2.0`
+    * `:inference_timesteps` — Diffusion steps (4–30). Default: `10`
+    * `:min_len` — Min audio length in tokens. Default: `2`
+    * `:max_len` — Max token length. Default: `4096`
+    * `:normalize` — Text normalization. Default: `false`
+    * `:denoise` — Denoise reference audio. Default: `false`
 
   ## Examples
 
-      # Basic TTS
-      {:ok, audio} = VoxCPMEx.generate(pid, "Hello, world!")
-
-      # Voice cloning
-      {:ok, audio} = VoxCPMEx.generate(pid, "Hello!",
-        audio_prompt: "reference.wav"
-      )
+      # Basic
+      {:ok, audio} = VoxCPMEx.generate(pid, "Hello!")
+      :ok = VoxCPMEx.save(audio, "out.wav")
 
       # Voice Design
       {:ok, audio} = VoxCPMEx.generate(pid,
-        "(warm male voice, confident) Welcome to the demo."
+        "(warm male voice) Welcome to the demo."
       )
 
-      # High quality (more steps, slower)
+      # Voice Cloning
+      {:ok, audio} = VoxCPMEx.generate(pid, "Hello!",
+        audio_prompt: "ref.wav"
+      )
+
+      # Quality tuning
       {:ok, audio} = VoxCPMEx.generate(pid, "Quality matters.",
         inference_timesteps: 30, cfg_value: 3.0
       )
-
-      # Fast (fewer steps)
-      {:ok, audio} = VoxCPMEx.generate(pid, "Speed matters.",
-        inference_timesteps: 4
-      )
-
   """
-  @spec generate(GenServer.server(), String.t(), [generate_opt()]) :: {:ok, audio()} | {:error, term()}
+  @spec generate(GenServer.server(), String.t(), [generate_opt()]) ::
+          {:ok, audio()} | {:error, term()}
   defdelegate generate(server, text, opts \\ []), to: Server
 
-  @doc """
-  Generates speech with a custom timeout. Same as `generate/3` but allows
-  specifying how long to wait for the generation to complete.
-  """
   @spec generate(GenServer.server(), String.t(), [generate_opt()], timeout()) ::
           {:ok, audio()} | {:error, term()}
   defdelegate generate(server, text, opts, timeout), to: Server
 
+  # ---------------------------------------------------------------------------
+  # Streaming Generation (v2)
+  # ---------------------------------------------------------------------------
+
   @doc """
-  Generates speech using VoxCPM2's internal streaming pipeline.
+  Starts **asynchronous streaming** generation.
 
-  Returns `{:ok, %{audio: binary, sample_rate: int, duration: float, num_chunks: int}}`.
+  Returns `{:ok, stream_ref}` immediately — the model generates in the
+  background and chunks are delivered to the GenServer as they're produced.
 
-  Useful for long utterances where you want progressive output.
+  Poll for chunks with `next_chunk/2`:
+      {:ok, chunk} → raw float32 PCM bytes
+      :eos → stream complete
+      {:error, reason}
+
+  Or collect everything at once with `collect_stream/2`.
+
+  ## Example
+
+      {:ok, ref} = VoxCPMEx.generate_streaming_async(pid, "Long text...")
+
+      # Poll for chunks
+      stream_loop(pid, ref)
+
+      defp stream_loop(pid, ref) do
+        case VoxCPMEx.next_chunk(pid, ref) do
+          {:ok, chunk} ->
+            play_chunk(chunk)
+            stream_loop(pid, ref)
+          :eos -> :ok
+          {:error, reason} -> Logger.error("Stream error")
+        end
+      end
   """
-  @spec generate_streaming(GenServer.server(), String.t(), [generate_opt()]) ::
-          {:ok, map()} | {:error, term()}
-  defdelegate generate_streaming(server, text, opts \\ []), to: Server
+  @spec generate_streaming_async(GenServer.server(), String.t(), [generate_opt()]) ::
+          {:ok, reference()} | {:error, term()}
+  defdelegate generate_streaming_async(server, text, opts \\ []), to: Server
+
+  @doc """
+  Returns the next chunk from an active streaming session.
+
+  Returns:
+    * `{:ok, chunk}` — raw float32 PCM bytes for this chunk
+    * `:eos` — stream is complete, no more chunks
+    * `{:error, reason}`
+  """
+  @spec next_chunk(GenServer.server(), reference()) ::
+          {:ok, binary()} | :eos | {:error, term()}
+  defdelegate next_chunk(server, ref), to: Server
+
+  @doc """
+  Collects all remaining chunks from a streaming session and returns
+  the full concatenated audio as raw bytes.
+
+  Returns `{:ok, audio_bytes}` when all chunks are collected,
+  or `{:error, reason}`.
+  """
+  @spec collect_stream(GenServer.server(), reference()) ::
+          {:ok, binary()} | {:error, term()}
+  defdelegate collect_stream(server, ref), to: Server
 
   # ---------------------------------------------------------------------------
   # I/O
@@ -206,12 +226,6 @@ defmodule VoxCPMEx do
 
   @doc """
   Saves audio binary to a WAV file.
-
-  ## Examples
-
-      {:ok, audio} = VoxCPMEx.generate(pid, "Hello!")
-      :ok = VoxCPMEx.save(audio, "output.wav")
-
   """
   @spec save(audio(), Path.t()) :: :ok | {:error, term()}
   defdelegate save(audio, path), to: Server
@@ -221,16 +235,14 @@ defmodule VoxCPMEx do
   # ---------------------------------------------------------------------------
 
   @doc """
-  Loads LoRA fine-tuning weights from a checkpoint file.
-
-  Returns `{:ok, loaded_count, skipped_count}` on success.
+  Loads LoRA fine-tuning weights. Returns `{:ok, loaded, skipped}`.
   """
   @spec load_lora(GenServer.server(), String.t()) ::
           {:ok, non_neg_integer(), non_neg_integer()} | {:error, term()}
   defdelegate load_lora(server, lora_path), to: Server
 
   @doc """
-  Resets all LoRA weights to zero (disables LoRA without unloading).
+  Resets all LoRA weights to zero.
   """
   @spec unload_lora(GenServer.server()) :: :ok | {:error, term()}
   defdelegate unload_lora(server), to: Server
