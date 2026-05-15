@@ -1,8 +1,8 @@
 defmodule VoxCPMEx.MixProject do
   use Mix.Project
 
-  @version "0.3.0"
-  @source_url "https://github.com/holsee/voxcpmex"
+  @version "0.3.1"
+  @source_url "https://github.com/boyzwj/voxcpmex"
 
   def project do
     [
