@@ -23,6 +23,7 @@ defmodule VoxCPMEx.Server do
           | {:load_denoiser, boolean()}
           | {:optimize, boolean()}
           | {:name, atom()}
+          | {:python, String.t()}
   @type start_opts :: [model_option()]
 
   @type generate_opt ::
@@ -58,10 +59,10 @@ defmodule VoxCPMEx.Server do
   end
 
   @doc """
-  Waits for the model to finish loading.
+  Blocks until the model finishes loading.
 
-  Returns `:ok` when ready, `{:error, :loading}` if still initializing,
-  or `{:error, reason}` if initialization failed.
+  Returns `:ok` when ready, or `{:error, reason}` if initialization failed.
+  Raises on timeout (default 120s).
   """
   @spec await_ready(GenServer.server(), timeout()) :: :ok | {:error, term()}
   def await_ready(server, timeout \\ 120_000) do
@@ -136,14 +137,23 @@ defmodule VoxCPMEx.Server do
     unless File.exists?(bridge_path) do
       {:stop, "Python bridge not found: #{bridge_path}"}
     else
-      python_cmd = System.find_executable("python3") || System.find_executable("python") || "python3"
+      python_cmd =
+        cond do
+          opts[:python] ->
+            opts[:python]
+
+          File.exists?(Path.join([File.cwd!(), ".venv", "bin", "python3"])) ->
+            Path.join([File.cwd!(), ".venv", "bin", "python3"])
+
+          true ->
+            System.find_executable("python3") || System.find_executable("python") || "python3"
+        end
 
       port =
         Port.open({:spawn_executable, python_cmd}, [
           :binary,
           :use_stdio,
           :exit_status,
-          :stderr_to_stdout,
           args: ["-u", bridge_path]
         ])
 
@@ -164,7 +174,8 @@ defmodule VoxCPMEx.Server do
         buffer: <<>>,
         pending: :queue.new(),
         streams: %{},
-        stream_timers: %{}
+        stream_timers: %{},
+        ready_waiters: []
       }
 
       {:ok, state}
@@ -198,11 +209,14 @@ defmodule VoxCPMEx.Server do
     }, state}
   end
 
-  def handle_call(:await_ready, _from, state) do
+  def handle_call(:await_ready, from, state) do
     case state.status do
-      :ready -> {:reply, :ok, state}
-      :loading -> {:reply, {:error, :loading}, state}
-      {:error, reason} -> {:reply, {:error, reason}, state}
+      :ready ->
+        {:reply, :ok, state}
+      :loading ->
+        {:noreply, %{state | ready_waiters: [from | state.ready_waiters]}}
+      {:error, reason} ->
+        {:reply, {:error, reason}, state}
     end
   end
 
@@ -302,9 +316,7 @@ defmodule VoxCPMEx.Server do
   def handle_info({_port, {:data, data}}, state) do
     {msgs, new_buffer} = parse_frames(state.buffer <> data)
 
-    state = Enum.reduce(msgs, %{state | buffer: new_buffer}, fn msg, acc ->
-      handle_message(msg, acc)
-    end)
+    state = Enum.reduce(msgs, %{state | buffer: new_buffer}, &handle_message(&1, &2))
 
     {:noreply, state}
   end
@@ -312,6 +324,12 @@ defmodule VoxCPMEx.Server do
   @impl true
   def handle_info({_port, {:exit_status, status}}, state) do
     Logger.error("VoxCPM bridge exited with status #{status}")
+
+    if state.buffer != <<>> do
+      Logger.error("Bridge last stderr output: #{String.slice(state.buffer, 0, 2048)}")
+    end
+
+    reply_all(state.ready_waiters, {:error, "bridge exited with status #{status}"})
     {:stop, {:bridge_exit, status}, state}
   end
 
@@ -337,7 +355,8 @@ defmodule VoxCPMEx.Server do
     cond do
       Map.has_key?(msg, "device") ->
         Logger.info("VoxCPM loaded on #{msg["device"]}, sr=#{msg["sample_rate"]}")
-        %{state | status: :ready, device: msg["device"], sample_rate: msg["sample_rate"]}
+        reply_all(state.ready_waiters, :ok)
+        %{state | status: :ready, device: msg["device"], sample_rate: msg["sample_rate"], ready_waiters: []}
 
       Map.has_key?(msg, "audio") ->
         {{:value, {from, _type, t0}}, new_pending} = :queue.out(state.pending)
@@ -372,15 +391,12 @@ defmodule VoxCPMEx.Server do
           {state.pending, state}
       end
 
-    # If this error arrived during init, update status
-    updated_state =
-      if updated_state.status == :loading do
-        %{updated_state | status: {:error, error}}
-      else
-        updated_state
-      end
-
-    %{updated_state | pending: new_pending}
+    if updated_state.status == :loading do
+      reply_all(updated_state.ready_waiters, {:error, error})
+      %{updated_state | status: {:error, error}, pending: new_pending, ready_waiters: []}
+    else
+      %{updated_state | pending: new_pending}
+    end
   end
 
   # -- streaming messages (v2.1: no stream_id, ref is implicit from pending) ---
@@ -498,16 +514,28 @@ defmodule VoxCPMEx.Server do
     parse_frames_loop(binary, [])
   end
 
-  defp parse_frames_loop(<<len::32-unsigned-big-integer, rest::binary>>, acc)
-       when byte_size(rest) >= len - @frame_header_bytes do
-    payload_size = len - @frame_header_bytes
-    <<payload::binary-size(payload_size), remaining::binary>> = rest
+  defp parse_frames_loop(<<len::32-unsigned-big-integer, rest::binary>>, acc) do
+    frame_size = len - @frame_header_bytes
 
-    msg = Msgpax.unpack!(payload)
-    parse_frames_loop(remaining, [msg | acc])
+    cond do
+      frame_size >= 0 and frame_size < 50_000_000 and byte_size(rest) >= frame_size ->
+        <<payload::binary-size(frame_size), remaining::binary>> = rest
+        msg = Msgpax.unpack!(payload)
+        parse_frames_loop(remaining, [msg | acc])
+
+      frame_size >= 0 and frame_size < 50_000_000 ->
+        {Enum.reverse(acc), <<len::32, rest::binary>>}
+
+      byte_size(rest) > 0 ->
+        <<_::8, rest2::binary>> = <<len::32, rest::binary>>
+        parse_frames_loop(rest2, acc)
+
+      true ->
+        {Enum.reverse(acc), <<>>}
+    end
   end
 
-  defp parse_frames_loop(partial, acc) do
+  defp parse_frames_loop(partial, acc) when byte_size(partial) < 4 do
     {Enum.reverse(acc), partial}
   end
 
@@ -540,6 +568,12 @@ defmodule VoxCPMEx.Server do
   end
 
   defp build_wav(_, _), do: <<>>
+
+  # -- Helpers ----------------------------------------------------------------
+
+  defp reply_all(waiters, reply) do
+    Enum.each(waiters, &GenServer.reply(&1, reply))
+  end
 
   # -- Stream timer helpers ---------------------------------------------------
 

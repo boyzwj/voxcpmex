@@ -4,19 +4,20 @@ Elixir wrapper for [VoxCPM2](https://huggingface.co/openbmb/VoxCPM2) — a **tok
 
 **2B parameters** · **30 languages** · **48kHz output** · trained on **2M+ hours** of speech data.
 
-[![Hex.pm](https://img.shields.io/badge/hex-v0.2.0-blue)](https://hex.pm/packages/voxcpmex)
+[![Hex.pm](https://img.shields.io/badge/hex-v0.3.1-blue)](https://hex.pm/packages/voxcpmex)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 [![Model](https://img.shields.io/badge/HuggingFace-VoxCPM2-orange)](https://huggingface.co/openbmb/VoxCPM2)
 [![Protocol](https://img.shields.io/badge/protocol-MessagePack-brightgreen)](https://msgpack.org/)
 
-## ⚡ v0.2.0 — MessagePack Protocol + True Streaming
+## ⚡ v0.3.1 — Production Hardening
 
-VoxCPMEx v0.2.0 replaces JSON+Base64 with **MessagePack binary framing**:
-
-- Audio is sent as **raw bytes** — no base64 encoding, ~33% smaller on the wire
-- Control messages are compact msgpack maps
-- Frame format: `[4B BE length][msgpack payload]` — no line splitting, no JSON parsing
-- **True streaming**: `generate_streaming_async/3` returns immediately, poll with `next_chunk/2`
+- **`uv`-based setup** — auto-installs `uv`, uses `uv pip install` for faster dependency management
+- **Auto `.venv`** — creates a virtual environment in the project root to handle Debian/Ubuntu externally-managed Python
+- **Robust frame parsing** — `parse_frames` skips past non-msgpack data (tqdm progress bars) instead of blocking forever
+- **Blocking `await_ready`** — truly blocks until the model finishes loading, instead of returning `{:error, :loading}` immediately
+- **Separate stderr** — bridge progress and traceback go directly to terminal, not mixed into the msgpack stream
+- **`.venv` auto-detection** — `start_link` finds `.venv/bin/python3` automatically, no manual path needed
+- **`:python` option** — explicit Python path for custom environments
 
 ## Features
 
@@ -55,12 +56,15 @@ VoxCPMEx uses **Erlang Ports** to communicate with a Python process running the 
 ```elixir
 def deps do
   [
-    {:voxcpmex, "~> 0.1.0"}
+    {:voxcpmex, "~> 0.3.0"}
   ]
 end
 ```
 
 ### 2. Install Python dependencies
+
+Uses `uv` for fast dependency management — auto-installs it if missing.
+Creates a `.venv` in the project root automatically.
 
 ```bash
 # CUDA (NVIDIA GPU) — recommended
@@ -72,8 +76,8 @@ mix voxcpmex.setup --mps
 # CPU-only (no GPU required, slower)
 mix voxcpmex.setup --cpu
 
-# With virtual environment
-mix voxcpmex.setup --cuda --venv .venv
+# Custom virtual environment path
+mix voxcpmex.setup --venv /path/to/venv
 ```
 
 ## Quick Start
@@ -241,6 +245,7 @@ end)
 | `:load_denoiser` | Load audio denoiser for reference cleanup | `false` |
 | `:optimize` | Enable `torch.compile` | `true` |
 | `:name` | GenServer name | `nil` |
+| `:python` | Python interpreter path (auto-detects `.venv/bin/python3` first) | `nil` |
 
 ## Generation Options
 
@@ -268,6 +273,28 @@ Arabic, Burmese, Chinese (Mandarin + 四川话, 粤语, 吴语, 东北话, 河�
 | RTX 3090 | ~8 GB | ~0.5 estimated |
 | Apple M2 Max | Unified | Supported via MPS |
 | CPU | N/A | Functional, much slower |
+
+## Troubleshooting
+
+### Bridge exits immediately with status 1
+
+The Python bridge failed to start. Run `mix voxcpmex.setup` to install dependencies. If using a custom Python environment, pass `:python` to `start_link`:
+
+```elixir
+{:ok, pid} = VoxCPMEx.start_link(device: "cuda", python: "/path/to/bin/python3")
+```
+
+### Bridge process is silent on console
+
+Progress output (tqdm bars, loading messages) goes to the Python process's stderr and appears directly in your terminal. If you see nothing, the bridge may be crashing silently. Check the IEx Logger output for error messages.
+
+### `await_ready` never returns
+
+The model download + loading can take 30-120s on first run (downloads ~8GB). If it takes longer, check whether the bridge process is alive — the Python bridge writes progress to stderr visible in the terminal. If the bridge exited, re-run `mix voxcpmex.setup`.
+
+### "Externally managed" Python error on Debian/Ubuntu
+
+System Python on Debian/Ubuntu doesn't allow `pip install` system-wide. The `mix voxcpmex.setup` task now auto-creates a `.venv` in the project root to avoid this.
 
 ## License
 

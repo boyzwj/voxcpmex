@@ -67,7 +67,7 @@ defmodule VoxCPMEx do
   ## Installation
 
       # mix.exs
-      {:voxcpmex, "~> 0.2.0"}
+      {:voxcpmex, "~> 0.3.0"}
 
       # Install Python deps
       mix voxcpmex.setup
@@ -110,12 +110,13 @@ defmodule VoxCPMEx do
     * `:load_denoiser` — Load audio denoiser. Default: `false`
     * `:optimize` — Enable `torch.compile`. Default: `true`
     * `:name` — Optional GenServer name
+    * `:python` — Python interpreter path. Auto-detects `.venv/bin/python3` first.
   """
   @spec start_link(Server.start_opts()) :: GenServer.on_start()
   defdelegate start_link(opts), to: Server
 
   @doc """
-  Waits for the model to finish loading. Returns `:ok` when ready.
+  Blocks until the model finishes loading. Returns `:ok` when ready.
   """
   @spec await_ready(GenServer.server(), timeout()) :: :ok | {:error, term()}
   defdelegate await_ready(server, timeout \\ 120_000), to: Server
