@@ -37,8 +37,9 @@ defmodule VoxCPMEx.MixProject do
 
   defp description do
     """
-    Elixir wrapper for VoxCPM2 — 2B-param, 30-language, 48kHz TTS with
-    Voice Design, controllable cloning, and true chunk-by-chunk streaming.
+    Elixir wrappers for TTS models:
+    - VoxCPM2: 2B-param, 30-language, 48kHz TTS with Voice Design and streaming.
+    - MOSS-TTS-Nano: 0.1B-param, 20-language, CPU-friendly, voice-cloning TTS.
     Uses MessagePack binary protocol for zero-overhead audio transfer.
     """
   end
@@ -50,7 +51,7 @@ defmodule VoxCPMEx.MixProject do
       links: %{
         "GitHub" => @source_url,
         "VoxCPM2" => "https://huggingface.co/openbmb/VoxCPM2",
-        "VoxCPM" => "https://github.com/OpenBMB/VoxCPM"
+        "MOSS-TTS-Nano" => "https://huggingface.co/OpenMOSS-Team/MOSS-TTS-Nano-100M"
       },
       files: ~w(lib priv examples mix.exs README.md LICENSE .formatter.exs)
     ]
@@ -60,7 +61,11 @@ defmodule VoxCPMEx.MixProject do
     [
       main: "VoxCPMEx",
       source_ref: "v#{@version}",
-      source_url: @source_url
+      source_url: @source_url,
+      groups_for_modules: [
+        "VoxCPM2": [VoxCPMEx, VoxCPMEx.Server],
+        "MOSS-TTS-Nano": [MossTTSNano, MossTTSNano.Server]
+      ]
     ]
   end
 
